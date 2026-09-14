@@ -324,15 +324,17 @@ test("V1 hydrates existing descendants and blockers without fetching historical 
   tui.addSession({ id: "a" });
   tui.addSession({ id: "child", parentID: "a" }, false);
   tui.addSession({ id: "nested", parentID: "child" }, false);
+  tui.addSession({ id: "unrelated" });
   tui.statuses.nested = { type: "retry" };
   tui.questions.push({ id: "pending", sessionID: "nested" });
+  tui.permissions.push({ id: "unrelated-orphan", sessionID: "unrelated" });
   tui.select("a");
   await plugin.tui(tui.api);
   await waitUntil(() => states().at(-1) === "blocked");
   expect(states()).not.toContain("idle");
   expect(tui.calls.filter((call) => call.startsWith("get:")).sort()).toEqual(["get:child", "get:nested"]);
   const calls = [...tui.calls];
-  await Bun.sleep(250);
+  await Bun.sleep(1_100);
   expect(tui.calls).toEqual(calls);
   tui.emit("question.rejected", { sessionID: "nested", requestID: "pending" });
   await waitUntil(() => states().at(-1) === "working");
@@ -401,6 +403,30 @@ test("V1 resnapshots on reconnection after missed completion", async () => {
   tui.emit("server.connected");
   await waitUntil(() => states().at(-1) === "idle");
   expect(tui.calls.filter((call) => call === "status")).toHaveLength(2);
+});
+
+test("V1 refreshes a hydrated idle owner's silently cancelled request, retrying failures", async () => {
+  const plugin = await loadPlugin();
+  const tui = fakeApi();
+  tui.addSession({ id: "a" });
+  tui.addSession({ id: "child", parentID: "a" }, false);
+  tui.permissions.push({ id: "cancelled", sessionID: "child" });
+  const list = tui.api.client.permission.list;
+  let snapshots = 0;
+  tui.api.client.permission.list = async () => {
+    if (++snapshots === 2) throw new Error("temporary disconnection");
+    return list();
+  };
+  tui.select("a");
+  await plugin.tui(tui.api);
+  await waitUntil(() => states().at(-1) === "blocked");
+  // OpenCode's cancellation finalizer removes the request after idle, without
+  // a reply event. No busy status exists for this owner in the initial snapshot.
+  tui.permissions.length = 0;
+  await waitUntil(() => states().at(-1) === "idle", 3_000);
+  expect(snapshots).toBe(3);
+  await Bun.sleep(150);
+  expect(snapshots).toBe(3);
 });
 
 test("V1 rejects A/B/A stale hydration and connections and disposes listeners", async () => {

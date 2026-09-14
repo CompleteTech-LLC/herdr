@@ -153,8 +153,23 @@ async function tui(api) {
     if (ctx.hydrated && [...owners(ctx)].every((id) => root(ctx, id) !== undefined)) return "idle";
   }
 
+  function scheduleBlockerRefresh(ctx) {
+    if (!ctx.selected) {
+      ctx.refreshAt = Infinity;
+      return;
+    }
+    if (ctx.loading || !ctx.hydrated) return;
+    // Attachment can land between native idle and silent request cleanup.
+    // Refresh only pending requests whose owner is no longer active; normal
+    // execution and settled idle sessions remain event-driven.
+    const unsettled = [...ctx.blockers.values()].some((id) =>
+      !ctx.statuses.has(id) && root(ctx, id) === ctx.selected);
+    ctx.refreshAt = unsettled ? Math.min(ctx.refreshAt, Date.now() + 1_000) : Infinity;
+  }
+
   function publish(ctx, selection = false) {
     if (!current(ctx) || !ctx.selected) return;
+    scheduleBlockerRefresh(ctx);
     ctx.selectionPending ||= selection;
     if (ctx.queued) return;
     ctx.queued = true;
@@ -238,7 +253,10 @@ async function tui(api) {
       ctx.statuses.delete(id);
       ctx.errors.delete(id);
       clearRequests(ctx, id);
-      if (id === ctx.selected) ctx.selected = undefined;
+      if (id === ctx.selected) {
+        ctx.selected = undefined;
+        ctx.refreshAt = Infinity;
+      }
       return;
     }
     if (ctx.deleted.has(id)) return;
@@ -311,6 +329,7 @@ async function tui(api) {
     } finally {
       ctx.loading = false;
       ctx.events = [];
+      if (current(ctx)) scheduleBlockerRefresh(ctx);
     }
   }
 
@@ -326,7 +345,7 @@ async function tui(api) {
         lookups: new Map(), statuses: new Map(), blockers: new Map(),
         errors: new Set(), deleted: new Set(), events: [],
         hydrated: false, loading: false, resolving: false,
-        retryIndex: 0, selectionAt: 0, retryAt: Infinity,
+        retryIndex: 0, selectionAt: 0, retryAt: Infinity, refreshAt: Infinity,
       };
       context = ctx;
       reconcile(ctx);
@@ -343,6 +362,10 @@ async function tui(api) {
       ctx.retryAt = Infinity;
       if (!ctx.hydrated) void hydrate(ctx);
       reconcile(ctx);
+    }
+    if (!ctx.loading && Date.now() >= ctx.refreshAt) {
+      ctx.refreshAt = Infinity;
+      void hydrate(ctx);
     }
   }
 
