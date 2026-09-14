@@ -50,11 +50,6 @@ const integrations = [
 ] as const;
 
 const socketPlugins = [
-  {
-    name: "OpenCode",
-    modulePath: "./opencode/herdr-agent-state.js",
-    sessionID: "opencode-session",
-  },
   { name: "Kilo", modulePath: "./kilo/herdr-agent-state.js", sessionID: "kilo-session" },
 ] as const;
 
@@ -148,14 +143,40 @@ for (const socketPlugin of socketPlugins) {
   });
 }
 
-test("OpenCode stays disabled without the Herdr socket environment", async () => {
+test("OpenCode TUI stays disabled without the Herdr socket environment", async () => {
   process.env.HERDR_ENV = "1";
   process.env.HERDR_PANE_ID = "test:p1";
   delete process.env.HERDR_SOCKET_PATH;
 
-  const { HerdrAgentStatePlugin } = await importFresh("./opencode/herdr-agent-state.js");
+  const { default: plugin } = await importFresh("./opencode/herdr-tui-session.js");
 
-  expect(await HerdrAgentStatePlugin()).toEqual({});
+  expect(await plugin.tui({})).toBeUndefined();
+});
+
+test("OpenCode TUI maps the Windows socket marker to a named pipe", async () => {
+  const markerPath = `herdr-opencode-${process.pid}.sock`;
+  configureIntegrationEnvironment(markerPath);
+  Object.defineProperty(process, "platform", { value: "win32" });
+  const connectedEndpoint = captureConnectionEndpoint();
+  const { default: plugin } = await importFresh("./opencode/herdr-tui-session.js");
+  let dispose = () => {};
+  try {
+    await plugin.tui({
+      route: { current: { name: "session", params: { sessionID: "root" } } },
+      state: { session: { get: () => ({ id: "root" }) } },
+      client: {
+        session: { status: async () => ({ data: {} }) },
+        permission: { list: async () => ({ data: [] }) },
+        question: { list: async () => ({ data: [] }) },
+      },
+      event: { on: () => () => {} },
+      lifecycle: { onDispose: (handler: () => void) => { dispose = handler; } },
+    });
+    await waitFor(() => connectedEndpoint() !== undefined);
+    expect(connectedEndpoint()).toBe(`\\\\.\\pipe\\${markerPath}`);
+  } finally {
+    dispose();
+  }
 });
 
 for (const integration of integrations) {
