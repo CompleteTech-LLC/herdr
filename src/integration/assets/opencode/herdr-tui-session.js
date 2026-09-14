@@ -67,65 +67,310 @@ export default {
   // Keep this plain object dependency-free: V1 and V2 expose different SDK
   // packages, but both loaders accept their own lifecycle entry on this object.
   setup,
-  tui: async (api) => {
-    if (
-      process.env.HERDR_ENV !== "1" ||
-      !process.env.HERDR_SOCKET_PATH ||
-      !process.env.HERDR_PANE_ID
-    ) {
+  tui,
+};
+
+// V1 also reports from the pane-local TUI. The shared server cannot identify
+// which attached client's session belongs to the pane that launched it.
+async function tui(api) {
+  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_SOCKET_PATH || !process.env.HERDR_PANE_ID) return;
+
+  let disposed = false;
+  let context;
+  let sequence = Date.now() * 1000;
+  let chain = Promise.resolve();
+
+  function routeID() {
+    const route = api.route.current;
+    return route?.name === "session" ? route.params?.sessionID : undefined;
+  }
+
+  function current(ctx) {
+    return !disposed && context === ctx && routeID() === ctx.route;
+  }
+
+  async function read(ctx, request) {
+    const result = await request({
+      signal: AbortSignal.any([ctx.controller.signal, AbortSignal.timeout(5_000)]),
+      throwOnError: true,
+    });
+    if (!current(ctx) || result?.data === undefined) throw new Error("session data unavailable");
+    return result.data;
+  }
+
+  function root(ctx, id) {
+    const seen = new Set();
+    while (typeof id === "string" && !seen.has(id)) {
+      if (ctx.deleted.has(id)) return;
+      seen.add(id);
+      const session = ctx.sessions.get(id) ?? api.state.session.get(id);
+      if (!session) return;
+      if (!session.parentID) return id;
+      id = session.parentID;
+    }
+  }
+
+  async function resolveRoot(ctx, id) {
+    const seen = new Set();
+    while (typeof id === "string" && !seen.has(id)) {
+      if (ctx.deleted.has(id)) return;
+      seen.add(id);
+      let session = ctx.sessions.get(id) ?? api.state.session.get(id);
+      if (!session) {
+        if (!ctx.lookups.has(id)) {
+          const requestedID = id;
+          const lookup = read(ctx, (options) => api.client.session.get({ sessionID: requestedID }, options));
+          ctx.lookups.set(id, lookup);
+          lookup.finally(() => ctx.lookups.delete(requestedID)).catch(() => {});
+        }
+        session = await ctx.lookups.get(id);
+        if (ctx.deleted.has(id)) return;
+        // An event may have supplied newer ancestry meanwhile.
+        session = ctx.sessions.get(id) ?? session;
+        if (session.id !== id) throw new Error("unexpected session identity");
+        ctx.sessions.set(id, session);
+      }
+      if (!session.parentID) return id;
+      id = session.parentID;
+    }
+  }
+
+  function owners(ctx) {
+    return new Set([...ctx.statuses.keys(), ...ctx.blockers.values()]);
+  }
+
+  function state(ctx) {
+    if (!ctx.selected) return;
+    for (const owner of ctx.blockers.values()) {
+      if (root(ctx, owner) === ctx.selected) return "blocked";
+    }
+    if (ctx.errors.has(ctx.selected)) return "blocked";
+    for (const owner of ctx.statuses.keys()) {
+      if (root(ctx, owner) === ctx.selected) return "working";
+    }
+    // Empty caches or unresolved active owners cannot establish idle.
+    // The successful native status snapshot omits idle sessions.
+    if (ctx.hydrated && [...owners(ctx)].every((id) => root(ctx, id) !== undefined)) return "idle";
+  }
+
+  function publish(ctx, selection = false) {
+    if (!current(ctx) || !ctx.selected) return;
+    ctx.selectionPending ||= selection;
+    if (ctx.queued) return;
+    ctx.queued = true;
+    chain = chain.then(async () => {
+      ctx.queued = false;
+      if (!current(ctx)) return;
+      const selected = ctx.selected;
+      const isCurrent = () => current(ctx) && !!selected &&
+        ctx.selected === selected && root(ctx, ctx.route) === selected;
+      if (!isCurrent()) return;
+      if (ctx.selectionPending) {
+        const delivered = await requestOnce(selected, undefined, undefined, isCurrent);
+        if (!isCurrent()) return;
+        if (!delivered) {
+          ctx.retryAt = Date.now() + 500;
+          return;
+        }
+        ctx.selectionPending = false;
+        ctx.lastState = undefined;
+      }
+      const value = state(ctx);
+      if (value === undefined || value === ctx.lastState) return;
+      const delivered = await requestOnce(selected, value, ++sequence, isCurrent);
+      if (!isCurrent()) return;
+      if (delivered) ctx.lastState = value;
+      else {
+        // The server may have applied a write whose acknowledgement was lost.
+        ctx.lastState = undefined;
+        ctx.retryAt = Date.now() + 500;
+      }
+    }).catch(() => {
+      if (current(ctx)) {
+        ctx.lastState = undefined;
+        ctx.retryAt = Date.now() + 500;
+      }
+    });
+  }
+
+  function reconcile(ctx) {
+    if (!current(ctx)) return;
+    publish(ctx);
+    if (ctx.resolving) {
+      ctx.resolveAgain = true;
       return;
     }
+    ctx.resolving = true;
+    void (async () => {
+      const selected = await resolveRoot(ctx, ctx.route);
+      if (!current(ctx) || !selected || root(ctx, ctx.route) !== selected) return;
+      if (selected && selected !== ctx.selected) {
+        ctx.selected = selected;
+        publish(ctx, true);
+      }
+      // Resolve active/request-bearing ancestry, never the entire history or
+      // a tree on every route poll. Requests are deduplicated within the epoch.
+      await Promise.all([...owners(ctx)].map((id) => resolveRoot(ctx, id)));
+      if (current(ctx)) publish(ctx);
+    })().catch(() => {
+      if (current(ctx)) ctx.retryAt = Date.now() + 500;
+    }).finally(() => {
+      ctx.resolving = false;
+      if (ctx.resolveAgain) {
+        ctx.resolveAgain = false;
+        reconcile(ctx);
+      }
+    });
+  }
 
-    let selectedSessionID;
-    let retryIndex = 0;
-    let nextReportAt = 0;
-    let reportPending = false;
-    const syncSelectedSession = async () => {
-      const route = api.route.current;
-      const sessionID = route?.name === "session" ? route.params?.sessionID : undefined;
-      const session =
-        typeof sessionID === "string" && sessionID
-          ? api.state.session.get(sessionID)
-          : undefined;
-      if (!session || session.parentID) {
-        selectedSessionID = undefined;
-        retryIndex = 0;
-        nextReportAt = 0;
-        return;
-      }
-      if (sessionID !== selectedSessionID) {
-        selectedSessionID = sessionID;
-        retryIndex = 0;
-        nextReportAt = 0;
-      }
-      if (reportPending || Date.now() < nextReportAt) {
-        return;
-      }
+  function clearRequests(ctx, id) {
+    for (const [key, owner] of ctx.blockers) if (owner === id) ctx.blockers.delete(key);
+  }
 
-      const reportingSessionID = sessionID;
-      reportPending = true;
-      try {
-        await requestOnce(reportingSessionID);
-      } catch {
-        // Best-effort reporting retries below while the selected route remains active.
-      } finally {
-        reportPending = false;
+  function apply(ctx, event) {
+    const data = event.properties;
+    if (!data) return;
+    const id = data.sessionID ?? data.info?.id;
+    if (typeof id !== "string") return;
+    if (event.type === "session.deleted") {
+      ctx.deleted.add(id);
+      ctx.sessions.delete(id);
+      ctx.statuses.delete(id);
+      ctx.errors.delete(id);
+      clearRequests(ctx, id);
+      if (id === ctx.selected) ctx.selected = undefined;
+      return;
+    }
+    if (ctx.deleted.has(id)) return;
+    switch (event.type) {
+      case "session.created":
+      case "session.updated":
+        if (data.info) ctx.sessions.set(id, data.info);
+        break;
+      case "session.status":
+      case "session.idle": {
+        const status = event.type === "session.idle" ? "idle" : data.status?.type;
+        if (status === "busy" || status === "retry") {
+          ctx.statuses.set(id, status);
+          ctx.errors.delete(id);
+        } else if (status === "idle") {
+          ctx.statuses.delete(id);
+          ctx.errors.delete(id);
+          // Native cancellation removes requests without emitting replies.
+          // Terminal status clears this owner, never its descendants.
+          clearRequests(ctx, id);
+        }
+        break;
       }
-      if (selectedSessionID !== reportingSessionID) {
-        retryIndex = 0;
-        nextReportAt = 0;
-        return;
-      }
-      const retryDelay = SELECTION_RETRY_DELAYS_MS[retryIndex];
-      retryIndex += 1;
-      nextReportAt = retryDelay === undefined ? Number.POSITIVE_INFINITY : Date.now() + retryDelay;
-    };
+      case "session.error":
+        if (data.error?.name !== "MessageAbortedError") ctx.errors.add(id);
+        break;
+      case "permission.asked":
+      case "question.asked":
+        if (typeof data.id === "string") ctx.blockers.set(`${event.type.split(".")[0]}:${data.id}`, id);
+        break;
+      case "permission.replied":
+      case "question.replied":
+      case "question.rejected":
+        ctx.blockers.delete(`${event.type.split(".")[0]}:${data.requestID}`);
+        break;
+    }
+  }
 
-    await syncSelectedSession();
-    const routePoll = setInterval(() => void syncSelectedSession(), ROUTE_POLL_INTERVAL_MS);
-    api.lifecycle.onDispose(() => clearInterval(routePoll));
-  },
-};
+  async function hydrate(ctx) {
+    if (ctx.loading || !current(ctx)) return;
+    ctx.loading = true;
+    ctx.events = [];
+    try {
+      const [statuses, permissions, questions] = await Promise.all([
+        read(ctx, (options) => api.client.session.status(undefined, options)),
+        read(ctx, (options) => api.client.permission.list(undefined, options)),
+        read(ctx, (options) => api.client.question.list(undefined, options)),
+      ]);
+      if (!current(ctx)) return;
+      if (!statuses || Array.isArray(statuses) || !Array.isArray(permissions) || !Array.isArray(questions)) {
+        throw new Error("incomplete session snapshot");
+      }
+      ctx.statuses.clear();
+      ctx.blockers.clear();
+      for (const [id, status] of Object.entries(statuses)) {
+        if (!ctx.deleted.has(id) && (status.type === "busy" || status.type === "retry")) ctx.statuses.set(id, status.type);
+      }
+      for (const [kind, requests] of [["permission", permissions], ["question", questions]]) {
+        for (const request of requests) {
+          if (!ctx.deleted.has(request.sessionID)) ctx.blockers.set(`${kind}:${request.id}`, request.sessionID);
+        }
+      }
+      // Events precede native map updates. Replay every delta received during
+      // this snapshot, including terminal states and request removals.
+      for (const event of ctx.events) apply(ctx, event);
+      ctx.hydrated = true;
+      reconcile(ctx);
+    } catch {
+      if (current(ctx)) ctx.retryAt = Date.now() + 500;
+    } finally {
+      ctx.loading = false;
+      ctx.events = [];
+    }
+  }
+
+  function syncSelection(reset = false) {
+    if (disposed) return;
+    const id = routeID();
+    if (reset || id !== context?.route) {
+      context?.controller.abort();
+      context = undefined;
+      if (typeof id !== "string" || !id) return;
+      const ctx = {
+        route: id, controller: new AbortController(), sessions: new Map(),
+        lookups: new Map(), statuses: new Map(), blockers: new Map(),
+        errors: new Set(), deleted: new Set(), events: [],
+        hydrated: false, loading: false, resolving: false,
+        retryIndex: 0, selectionAt: 0, retryAt: Infinity,
+      };
+      context = ctx;
+      reconcile(ctx);
+      void hydrate(ctx);
+    }
+    const ctx = context;
+    if (!ctx) return;
+    if (ctx.selected && Date.now() >= ctx.selectionAt) {
+      publish(ctx, true);
+      const delay = SELECTION_RETRY_DELAYS_MS[ctx.retryIndex++];
+      ctx.selectionAt = delay === undefined ? Infinity : Date.now() + delay;
+    }
+    if (Date.now() >= ctx.retryAt) {
+      ctx.retryAt = Infinity;
+      if (!ctx.hydrated) void hydrate(ctx);
+      reconcile(ctx);
+    }
+  }
+
+  const subscriptions = [
+    "session.created", "session.updated", "session.deleted", "session.status", "session.idle",
+    "session.error", "permission.asked", "permission.replied",
+    "question.asked", "question.replied", "question.rejected",
+  ].map((type) => api.event.on(type, (event) => {
+    syncSelection();
+    const ctx = context;
+    if (!ctx) return;
+    if (ctx.loading) ctx.events.push(event);
+    apply(ctx, event);
+    reconcile(ctx);
+  }));
+  for (const type of ["server.connected", "server.instance.disposed", "global.disposed"]) {
+    subscriptions.push(api.event.on(type, () => syncSelection(true)));
+  }
+  const poll = setInterval(syncSelection, ROUTE_POLL_INTERVAL_MS);
+  api.lifecycle.onDispose(() => {
+    disposed = true;
+    context?.controller.abort();
+    clearInterval(poll);
+    for (const unsubscribe of subscriptions) unsubscribe();
+  });
+  // Do not block TUI startup on remote SDK hydration.
+  syncSelection();
+}
 
 function setup(api) {
   if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_SOCKET_PATH || !process.env.HERDR_PANE_ID) return;

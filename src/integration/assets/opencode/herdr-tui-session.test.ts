@@ -7,6 +7,7 @@ const stateWaiters: Array<() => void> = [];
 let importCounter = 0;
 let holdConnections = false;
 let failConnections = false;
+let acknowledgeConnections = true;
 const connections: Array<() => void> = [];
 
 mock.module("node:net", () => ({
@@ -23,7 +24,7 @@ mock.module("node:net", () => ({
             stateWaiters.shift()?.();
           }
           requestWaiters.shift()?.();
-          queueMicrotask(() => client.emit("data"));
+          if (acknowledgeConnections) queueMicrotask(() => client.emit("data"));
         },
         setTimeout() {},
         on(event: string, handler: () => void) {
@@ -50,6 +51,7 @@ beforeEach(() => {
   stateWaiters.length = 0;
   holdConnections = false;
   failConnections = false;
+  acknowledgeConnections = true;
   connections.length = 0;
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = "test.sock";
@@ -70,12 +72,46 @@ async function loadPlugin() {
 
 function fakeApi() {
   const sessions = new Map<string, { id: string; parentID?: string }>();
+  const stored = new Map<string, { id: string; parentID?: string }>();
+  const listeners = new Map<string, Set<(event: unknown) => void>>();
+  const statuses: Record<string, { type: string }> = {};
+  const permissions: Array<{ id: string; sessionID: string }> = [];
+  const questions: Array<{ id: string; sessionID: string }> = [];
+  const calls: string[] = [];
   let current: { name: string; params?: { sessionID: string } } = { name: "home" };
   let dispose: (() => void) | undefined;
   activeDisposers.push(() => dispose?.());
 
   return {
+    statuses, permissions, questions, calls, listeners,
     api: {
+      client: {
+        session: {
+          async get({ sessionID }: { sessionID: string }) {
+            calls.push(`get:${sessionID}`);
+            const data = stored.get(sessionID);
+            if (!data) throw new Error("session not found");
+            return { data };
+          },
+          async status() {
+            calls.push("status");
+            return { data: { ...statuses } };
+          },
+        },
+        permission: {
+          async list() { calls.push("permission"); return { data: [...permissions] }; },
+        },
+        question: {
+          async list() { calls.push("question"); return { data: [...questions] }; },
+        },
+      },
+      event: {
+        on(type: string, handler: (event: unknown) => void) {
+          if (!listeners.has(type)) listeners.set(type, new Set());
+          listeners.get(type)!.add(handler);
+          return () => { listeners.get(type)!.delete(handler); };
+        },
+      },
       route: {
         get current() {
           return current;
@@ -95,8 +131,12 @@ function fakeApi() {
         },
       },
     },
-    addSession(session: { id: string; parentID?: string }) {
-      sessions.set(session.id, session);
+    addSession(session: { id: string; parentID?: string }, cached = true) {
+      stored.set(session.id, session);
+      if (cached) sessions.set(session.id, session);
+    },
+    emit(type: string, properties: Record<string, unknown> = {}) {
+      for (const receive of listeners.get(type) ?? []) receive({ type, properties });
     },
     select(sessionID: string) {
       current = { name: "session", params: { sessionID } };
@@ -140,7 +180,8 @@ test("retries an initial selection while Herdr detects the process", async () =>
   await plugin.tui(tui.api);
   await new Promise((resolve) => setTimeout(resolve, 125));
 
-  expect(requests.map((request) => requestParam(request, "agent_session_id"))).toEqual([
+  expect(requests.filter((request) => requestParam(request, "session_start_source") === "select")
+    .map((request) => requestParam(request, "agent_session_id"))).toEqual([
     "session-a",
     "session-a",
   ]);
@@ -169,13 +210,12 @@ test("does not replace the root session with a selected child session", async ()
   tui.addSession({ id: "child-session", parentID: "root-session" });
   tui.select("root-session");
   await plugin.tui(tui.api);
-  expect(requests).toHaveLength(1);
+  await waitUntil(() => states().includes("idle"));
 
   tui.select("child-session");
   await new Promise((resolve) => setTimeout(resolve, 125));
 
-  expect(requests).toHaveLength(1);
-  expect(requestParam(requests[0], "agent_session_id")).toBe("root-session");
+  expect(requests.every((request) => requestParam(request, "agent_session_id") === "root-session")).toBe(true);
 });
 
 test("stops route polling when the TUI plugin is disposed", async () => {
@@ -201,6 +241,267 @@ function requestParam(request: unknown, name: string): unknown {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
+
+function states() {
+  return requests.map((request) => requestParam(request, "state")).filter((state) => state !== undefined);
+}
+
+async function waitUntil(predicate: () => boolean, timeout = 2_000) {
+  const deadline = Date.now() + timeout;
+  while (!predicate() && Date.now() < deadline) await Bun.sleep(5);
+  expect(predicate()).toBe(true);
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function startV1() {
+  const plugin = await loadPlugin();
+  const tui = fakeApi();
+  for (const session of [
+    { id: "a" }, { id: "b" }, { id: "child", parentID: "a" },
+    { id: "sibling", parentID: "a" }, { id: "grandchild", parentID: "child" },
+    { id: "foreign", parentID: "b" },
+  ]) tui.addSession(session);
+  tui.select("a");
+  await plugin.tui(tui.api);
+  await waitUntil(() => states().includes("idle"));
+  return tui;
+}
+
+test("V1 keeps an idle parent working until every active descendant finishes", async () => {
+  const tui = await startV1();
+  for (const sessionID of ["a", "child", "sibling", "grandchild"]) {
+    tui.emit("session.status", { sessionID, status: { type: "busy" } });
+  }
+  await waitUntil(() => states().at(-1) === "working");
+  for (const sessionID of ["a", "child", "sibling"]) {
+    tui.emit("session.status", { sessionID, status: { type: "idle" } });
+    tui.emit("session.idle", { sessionID });
+  }
+  tui.emit("session.status", { sessionID: "grandchild", status: { type: "retry" } });
+  await Bun.sleep(30);
+  expect(states().at(-1)).toBe("working");
+  tui.emit("session.status", { sessionID: "grandchild", status: { type: "idle" } });
+  await waitUntil(() => states().at(-1) === "idle");
+  expect(requests.every((request) => requestParam(request, "agent_session_id") === "a")).toBe(true);
+});
+
+test("V1 child idle cannot finish a working root or count another root", async () => {
+  const tui = await startV1();
+  tui.emit("session.status", { sessionID: "a", status: { type: "busy" } });
+  tui.emit("session.status", { sessionID: "child", status: { type: "idle" } });
+  tui.emit("session.status", { sessionID: "foreign", status: { type: "busy" } });
+  tui.emit("question.asked", { sessionID: "foreign", id: "foreign-question" });
+  await waitUntil(() => states().at(-1) === "working");
+  tui.emit("session.status", { sessionID: "a", status: { type: "idle" } });
+  await waitUntil(() => states().at(-1) === "idle");
+});
+
+test("V1 retains sibling blockers and clears cancelled requests only for their owner", async () => {
+  const tui = await startV1();
+  tui.emit("session.status", { sessionID: "child", status: { type: "busy" } });
+  tui.emit("permission.asked", { sessionID: "child", id: "p" });
+  tui.emit("question.asked", { sessionID: "sibling", id: "q" });
+  await waitUntil(() => states().at(-1) === "blocked");
+  tui.emit("permission.replied", { sessionID: "child", requestID: "p" });
+  tui.emit("session.status", { sessionID: "a", status: { type: "idle" } });
+  await Bun.sleep(30);
+  expect(states().at(-1)).toBe("blocked");
+  tui.emit("session.error", { sessionID: "sibling", error: { name: "MessageAbortedError" } });
+  tui.emit("session.status", { sessionID: "sibling", status: { type: "idle" } });
+  await waitUntil(() => states().at(-1) === "working");
+  tui.emit("session.status", { sessionID: "child", status: { type: "idle" } });
+  await waitUntil(() => states().at(-1) === "idle");
+});
+
+test("V1 hydrates existing descendants and blockers without fetching historical trees", async () => {
+  const plugin = await loadPlugin();
+  const tui = fakeApi();
+  tui.addSession({ id: "a" });
+  tui.addSession({ id: "child", parentID: "a" }, false);
+  tui.addSession({ id: "nested", parentID: "child" }, false);
+  tui.statuses.nested = { type: "retry" };
+  tui.questions.push({ id: "pending", sessionID: "nested" });
+  tui.select("a");
+  await plugin.tui(tui.api);
+  await waitUntil(() => states().at(-1) === "blocked");
+  expect(states()).not.toContain("idle");
+  expect(tui.calls.filter((call) => call.startsWith("get:")).sort()).toEqual(["get:child", "get:nested"]);
+  const calls = [...tui.calls];
+  await Bun.sleep(250);
+  expect(tui.calls).toEqual(calls);
+  tui.emit("question.rejected", { sessionID: "nested", requestID: "pending" });
+  await waitUntil(() => states().at(-1) === "working");
+});
+
+test("V1 does not report idle before hydration or overwrite events with a late snapshot", async () => {
+  const plugin = await loadPlugin();
+  const tui = fakeApi();
+  const snapshot = deferred<{ data: Record<string, { type: string }> }>();
+  tui.api.client.session.status = () => snapshot.promise;
+  tui.addSession({ id: "a" });
+  tui.addSession({ id: "child", parentID: "a" });
+  tui.select("a");
+  await plugin.tui(tui.api);
+  await Bun.sleep(20);
+  expect(states()).toEqual([]);
+  tui.emit("session.status", { sessionID: "child", status: { type: "busy" } });
+  await waitUntil(() => states().at(-1) === "working");
+  snapshot.resolve({ data: {} });
+  await Bun.sleep(30);
+  expect(states()).not.toContain("idle");
+});
+
+test("V1 late hydration cannot revive a finished, replied, or deleted child", async () => {
+  const plugin = await loadPlugin();
+  const tui = fakeApi();
+  const snapshot = deferred<{ data: Record<string, { type: string }> }>();
+  tui.api.client.session.status = () => snapshot.promise;
+  tui.addSession({ id: "a" });
+  for (const id of ["child", "deleted"]) tui.addSession({ id, parentID: "a" });
+  tui.permissions.push({ id: "p", sessionID: "child" });
+  tui.questions.push({ id: "q", sessionID: "deleted" });
+  tui.select("a");
+  await plugin.tui(tui.api);
+  tui.emit("permission.replied", { sessionID: "child", requestID: "p" });
+  tui.emit("session.status", { sessionID: "child", status: { type: "idle" } });
+  tui.emit("session.deleted", { info: { id: "deleted", parentID: "a" } });
+  snapshot.resolve({ data: { child: { type: "busy" }, deleted: { type: "busy" } } });
+  await waitUntil(() => states().at(-1) === "idle");
+  expect(states()).not.toContain("blocked");
+  expect(states()).not.toContain("working");
+});
+
+test("V1 retries unavailable hydration and unknown ancestry without assuming idle", async () => {
+  const plugin = await loadPlugin();
+  const tui = fakeApi();
+  tui.addSession({ id: "a" });
+  tui.statuses.child = { type: "busy" };
+  const list = tui.api.client.question.list;
+  tui.api.client.question.list = async () => { throw new Error("offline"); };
+  tui.select("a");
+  await plugin.tui(tui.api);
+  await Bun.sleep(150);
+  expect(states()).toEqual([]);
+  tui.api.client.question.list = list;
+  await Bun.sleep(550);
+  expect(states()).toEqual([]);
+  tui.addSession({ id: "child", parentID: "a" }, false);
+  await waitUntil(() => states().at(-1) === "working");
+});
+
+test("V1 resnapshots on reconnection after missed completion", async () => {
+  const tui = await startV1();
+  tui.emit("session.status", { sessionID: "child", status: { type: "busy" } });
+  await waitUntil(() => states().at(-1) === "working");
+  tui.emit("server.connected");
+  await waitUntil(() => states().at(-1) === "idle");
+  expect(tui.calls.filter((call) => call === "status")).toHaveLength(2);
+});
+
+test("V1 rejects A/B/A stale hydration and connections and disposes listeners", async () => {
+  const plugin = await loadPlugin();
+  const tui = fakeApi();
+  tui.addSession({ id: "a" });
+  tui.addSession({ id: "b" });
+  const oldSnapshot = deferred<{ data: Record<string, { type: string }> }>();
+  const status = tui.api.client.session.status;
+  tui.api.client.session.status = () => oldSnapshot.promise;
+  holdConnections = true;
+  tui.select("a");
+  await plugin.tui(tui.api);
+  await waitUntil(() => connections.length > 0);
+  tui.select("b");
+  await Bun.sleep(125);
+  tui.api.client.session.status = status;
+  tui.select("a");
+  await Bun.sleep(125);
+  oldSnapshot.resolve({ data: { a: { type: "busy" } } });
+  holdConnections = false;
+  for (const connect of connections.splice(0)) connect();
+  await waitUntil(() => states().at(-1) === "idle");
+  expect(states()).not.toContain("working");
+  expect(requests.every((request) => requestParam(request, "agent_session_id") === "a")).toBe(true);
+  holdConnections = true;
+  tui.emit("session.status", { sessionID: "a", status: { type: "busy" } });
+  await waitUntil(() => connections.length > 0);
+  tui.dispose();
+  const count = requests.length;
+  for (const connect of connections.splice(0)) connect();
+  await Bun.sleep(30);
+  expect(requests).toHaveLength(count);
+  expect([...tui.listeners.values()].every((listeners) => listeners.size === 0)).toBe(true);
+});
+
+test("V1 retries latest lifecycle after selection retries expire and keeps sequence order", async () => {
+  const tui = await startV1();
+  await Bun.sleep(1_800);
+  failConnections = true;
+  tui.emit("session.status", { sessionID: "child", status: { type: "busy" } });
+  await Bun.sleep(50);
+  failConnections = false;
+  await waitUntil(() => states().at(-1) === "working");
+  const seq = requests.map((request) => requestParam(request, "seq")).filter((value) => typeof value === "number") as number[];
+  expect(seq.every((value, index) => index === 0 || value > seq[index - 1]!)).toBe(true);
+  expect(requests.filter((request) => requestParam(request, "session_start_source") === "select")
+    .every((request) => requestParam(request, "seq") === undefined)).toBe(true);
+});
+
+test("V1 deletion invalidates both ancestry completion and delayed socket writes", async () => {
+  const plugin = await loadPlugin();
+  const first = fakeApi();
+  first.addSession({ id: "a" });
+  first.select("a");
+  const installing = plugin.tui(first.api);
+  first.emit("session.deleted", { info: { id: "a" } });
+  await installing;
+  await Bun.sleep(30);
+  expect(requests).toHaveLength(0);
+  first.dispose();
+
+  const tui = await startV1();
+  holdConnections = true;
+  tui.emit("session.status", { sessionID: "a", status: { type: "busy" } });
+  await waitUntil(() => connections.length > 0);
+  tui.emit("session.deleted", { info: { id: "a" } });
+  const count = requests.length;
+  for (const connect of connections.splice(0)) connect();
+  await Bun.sleep(30);
+  expect(requests).toHaveLength(count);
+});
+
+test("V1 resends working when a blocked report was applied but its acknowledgement was lost", async () => {
+  const tui = await startV1();
+  tui.emit("session.status", { sessionID: "child", status: { type: "busy" } });
+  await waitUntil(() => states().at(-1) === "working");
+  await Bun.sleep(1_800);
+  acknowledgeConnections = false;
+  tui.emit("permission.asked", { sessionID: "child", id: "p" });
+  await waitUntil(() => states().at(-1) === "blocked");
+  tui.emit("permission.replied", { sessionID: "child", requestID: "p" });
+  acknowledgeConnections = true;
+  await waitUntil(() => states().at(-1) === "working");
+});
+
+test("V1 waits for cyclic ancestry to be corrected and keeps root errors interruptible", async () => {
+  const tui = await startV1();
+  tui.emit("session.created", { info: { id: "x", parentID: "y" } });
+  tui.emit("session.created", { info: { id: "y", parentID: "x" } });
+  tui.emit("session.status", { sessionID: "x", status: { type: "busy" } });
+  const count = states().length;
+  await Bun.sleep(30);
+  expect(states()).toHaveLength(count);
+  tui.emit("session.updated", { info: { id: "y", parentID: "a" } });
+  await waitUntil(() => states().at(-1) === "working");
+  tui.emit("session.error", { sessionID: "a", error: { name: "APIError" } });
+  await waitUntil(() => states().at(-1) === "blocked");
+  tui.emit("session.status", { sessionID: "a", status: { type: "idle" } });
+  await waitUntil(() => states().at(-1) === "working");
+});
 
 function v2Api() {
   const sessions = new Map([
@@ -242,8 +543,6 @@ function v2Api() {
 }
 
 const flushReports = () => new Promise((resolve) => setTimeout(resolve, 10));
-const states = () => requests.filter((r) => requestParam(r, "state") !== undefined)
-  .map((r) => requestParam(r, "state"));
 
 test("V2 ignores events without data", async () => {
   const plugin = await loadPlugin();
